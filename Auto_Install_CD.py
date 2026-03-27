@@ -3,10 +3,30 @@ import time
 import subprocess
 import json
 import sys
+import warnings
+
+warnings.filterwarnings(
+    "ignore",
+    message="Unable to find acceptable character detection dependency.*"
+)
+
 import requests
 import base64
-from multiprocessing import Pool
+from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
 from os.path import basename, join, isdir, abspath, getmtime, splitext
+from threading import Lock
+
+try:
+    import msvcrt
+except ImportError:
+    msvcrt = None
+
+COLOR_RESET = "\033[0m"
+COLOR_CYAN = "\033[96m"
+COLOR_GREEN = "\033[92m"
+COLOR_YELLOW = "\033[93m"
+COLOR_RED = "\033[91m"
 
 # ==========================================
 # ⚙️ 1. 설정 및 경로 관리
@@ -19,24 +39,175 @@ TEMP_DOWNLOAD_DIR = os.path.join(SCRIPT_DIR, "Downloads")
 if not os.path.exists(TEMP_DOWNLOAD_DIR):
     os.makedirs(TEMP_DOWNLOAD_DIR)
 
-def load_or_request_config():
-    if os.path.exists(CONFIG_FILE):
+def normalize_input_path(path_text):
+    cleaned = path_text.strip().replace('"', '').replace("'", "")
+    if not cleaned:
+        return ""
+    return os.path.abspath(os.path.expandvars(cleaned))
+
+def is_valid_base_path(path_text):
+    return bool(path_text) and os.path.exists(path_text) and isdir(path_text)
+
+def load_config_data():
+    if not os.path.exists(CONFIG_FILE):
+        return {}
+
+    try:
         with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
             data = json.load(f)
-            return data['onedrive_path']
-    else:
+            return data if isinstance(data, dict) else {}
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+def save_config_data(data):
+    with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+        json.dump(data, f, ensure_ascii=False, indent=4)
+
+def update_path_history(data, path_text):
+    history = data.get("path_history", [])
+    if not isinstance(history, list):
+        history = []
+
+    normalized_path = normalize_input_path(path_text)
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    history = [entry for entry in history if isinstance(entry, dict) and entry.get("path") != normalized_path]
+    history.insert(0, {"path": normalized_path, "saved_at": timestamp})
+    data["path_history"] = history[:10]
+
+def save_base_path(path_text):
+    normalized_path = normalize_input_path(path_text)
+    data = load_config_data()
+    data["onedrive_path"] = normalized_path
+    update_path_history(data, normalized_path)
+    save_config_data(data)
+    return normalized_path, data
+
+def prompt_for_base_path(existing_path=""):
+    while True:
         print("\n" + "="*42)
-        print(" 🔧 [최초 실행] 환경 설정이 필요합니다.")
+        print(" 🔧 최상위 폴더 경로 설정")
         print("="*42)
-        path_input = input("\n▶ 원드라이브 최상위 폴더 경로 입력: ").strip().replace('"', '').replace("'", "")
-        with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
-            json.dump({'onedrive_path': path_input}, f, ensure_ascii=False, indent=4)
-        return path_input
+        if existing_path:
+            print(f"현재 저장된 경로: {existing_path}")
+
+        path_input = input("\n▶ 원드라이브 최상위 폴더 경로 입력: ").strip()
+        normalized_path = normalize_input_path(path_input)
+
+        if is_valid_base_path(normalized_path):
+            return save_base_path(normalized_path)
+
+        print("❌ 존재하지 않는 폴더 경로입니다. 다시 입력해주세요.")
+        time.sleep(1)
+
+def load_or_request_config(force_change=False):
+    data = load_config_data()
+    saved_path = normalize_input_path(data.get("onedrive_path", ""))
+
+    if force_change:
+        return prompt_for_base_path(saved_path)
+
+    if is_valid_base_path(saved_path):
+        update_path_history(data, saved_path)
+        save_config_data(data)
+        return saved_path, data
+
+    return prompt_for_base_path(saved_path)
 
 def create_onedrive_direct_download(onedrive_link):
     data_bytes64 = base64.b64encode(bytes(onedrive_link, 'utf-8'))
     data_bytes64_String = data_bytes64.decode('utf-8').replace('/','_').replace('+','-').rstrip("=")
     return f"https://api.onedrive.com/v1.0/shares/u!{data_bytes64_String}/root/content"
+
+def prompt_menu_input(max_index):
+    prompt = f"▶ 번호 선택 (0, 9, 1~{max_index}) [ESC:새로고침, q:종료]: "
+    if msvcrt is None:
+        return input(prompt).strip().lower()
+
+    sys.stdout.write(prompt)
+    sys.stdout.flush()
+    buffer = []
+
+    while True:
+        key = msvcrt.getwch()
+
+        if key in ('\r', '\n'):
+            print()
+            return ''.join(buffer).strip().lower()
+
+        if key == '\x1b':
+            print()
+            return 'esc'
+
+        if key == '\x08':
+            if buffer:
+                buffer.pop()
+                sys.stdout.write('\b \b')
+                sys.stdout.flush()
+            continue
+
+        if key in ('\x00', '\xe0'):
+            msvcrt.getwch()
+            continue
+
+        buffer.append(key)
+        sys.stdout.write(key)
+        sys.stdout.flush()
+
+def render_scan_progress(phase_label, percent, current_count, total_count, found_files, start_time, color):
+    bar_width = 24
+    filled = int(bar_width * percent / 100)
+    bar = "█" * filled + "░" * (bar_width - filled)
+    elapsed = time.time() - start_time
+    sys.stdout.write(
+        f"\r{color}🔎 {phase_label} [{bar}] {percent:3d}%{COLOR_RESET} "
+        f"폴더 {current_count}/{total_count} / 대상 파일 {found_files}개 / {elapsed:.1f}s"
+    )
+    sys.stdout.flush()
+
+def scan_target_files(base_path):
+    win_path = base_path
+    if os.name == 'nt' and not win_path.startswith("\\\\?\\"):
+        win_path = "\\\\?\\" + os.path.abspath(win_path)
+
+    total_dirs = 0
+    count_start = time.time()
+    last_update = 0
+    for _, dirs, files in os.walk(win_path):
+        total_dirs += 1
+        now = time.time()
+        if now - last_update >= 0.05:
+            count_percent = min(50, total_dirs)
+            render_scan_progress("폴더 수 계산 중", count_percent, total_dirs, max(total_dirs, 1), 0, count_start, COLOR_CYAN)
+            last_update = now
+
+    total_dirs = max(total_dirs, 1)
+
+    found_files = []
+    scanned_dirs = 0
+    start_time = count_start
+    last_update = 0
+
+    for root, dirs, files in os.walk(win_path):
+        scanned_dirs += 1
+        now = time.time()
+        if now - last_update >= 0.05:
+            scan_percent = 50 + int((scanned_dirs / total_dirs) * 50)
+            render_scan_progress("파일 목록 스캔 중", min(scan_percent, 100), scanned_dirs, total_dirs, len(found_files), start_time, COLOR_GREEN)
+            last_update = now
+
+        for file in files:
+            ext = splitext(file)[1].lower()
+            if ext in TARGET_EXTENSIONS:
+                full_path = join(root, file)
+                try:
+                    found_files.append((full_path, getmtime(full_path)))
+                except:
+                    continue
+
+    render_scan_progress("파일 목록 스캔 중", 100, total_dirs, total_dirs, len(found_files), start_time, COLOR_YELLOW)
+    print()
+    found_files.sort(key=lambda x: x[1], reverse=True)
+    return found_files[:5]
 
 # ==========================================
 # 🛠️ 2. 핵심 워커 함수
@@ -73,82 +244,226 @@ def get_device_display_name(device):
         arch = "32비트"
 
     model = model.replace(" ", "-")
-    return f"{device}_{model}_{os_version}버전_{arch}"
+    return f"{device}_{model}_{os_version}OS_{arch}"
 
-def check_apk_installed(package_name, device):
-    command = f"adb -s {device} shell pm list packages {package_name}"
-    result = subprocess.run(command, shell=True, capture_output=True, text=True)
-    return package_name in result.stdout
+def extract_command_output(result):
+    stdout = (result.stdout or "").strip()
+    stderr = (result.stderr or "").strip()
+    return "\n".join(part for part in [stdout, stderr] if part).strip()
 
-def process_uninstall_task(args):
-    package_name, device, display_name = args
-    start_time = time.time()
-    if check_apk_installed(package_name, device):
-        print(f"   └  [{display_name}] '{package_name}' 삭제 중...")
-        subprocess.run(f"adb -s {device} uninstall {package_name}", shell=True, capture_output=True)
-        status = "✅ 삭제 완료"
-    else:
-        status = "⏩ 대상 없음"
-    return display_name, status, time.time() - start_time
+def summarize_failure_reason(output, returncode):
+    text = (output or "").strip()
+    lower = text.lower()
+
+    reason_map = [
+        ("install_failed_no_matching_abis", "32비트 기기/ABI 불일치"),
+        ("device offline", "adb 연결 끊김(device offline)"),
+        ("device not found", "adb 연결 끊김(device not found)"),
+        ("no devices/emulators found", "adb 기기 미연결"),
+        ("more than one device/emulator", "복수 기기 충돌"),
+        ("install_failed_insufficient_storage", "저장공간 부족"),
+        ("insufficient storage", "저장공간 부족"),
+        ("broken pipe", "adb 연결 끊김"),
+        ("connection reset", "adb 연결 끊김"),
+        ("closed", "adb 연결 끊김"),
+        ("unauthorized", "adb 디바이스 인증 필요"),
+    ]
+
+    for needle, message in reason_map:
+        if needle in lower:
+            return message
+
+    if text:
+        last_line = text.splitlines()[-1].strip()
+        return last_line[:80]
+
+    if returncode not in (0, None):
+        return f"명령 종료 코드 {returncode}"
+
+    return "원인 미확인"
+
+def set_device_progress(progress_state, lock, display_name, percent, message):
+    with lock:
+        progress_state[display_name] = {
+            "percent": percent,
+            "message": message,
+        }
+
+def render_device_progress(progress_state, device_order):
+    lines = []
+    for display_name in device_order:
+        info = progress_state.get(display_name, {"percent": 0, "message": "대기중"})
+        percent = max(0, min(100, int(info["percent"])))
+        percent_text = f"{percent:3d}%"
+        if "❌" in info["message"]:
+            percent_text = f"{COLOR_RED}{percent_text}{COLOR_RESET}"
+        lines.append(f"- [{display_name}] {percent_text} {info['message']}")
+    return lines
+
+def print_device_progress(progress_state, device_order, previously_rendered):
+    lines = render_device_progress(progress_state, device_order)
+
+    if previously_rendered:
+        sys.stdout.write(f"\033[{previously_rendered}F")
+
+    for line in lines:
+        sys.stdout.write("\033[2K" + line + "\n")
+
+    sys.stdout.flush()
+    return len(lines)
 
 def process_device_task(args):
-    file_path, device, file_ext, target_name, display_name = args
+    file_path, device, file_ext, target_name, display_name, progress_state, lock = args
     start_time = time.time()
+
     try:
         if file_ext == '.apk':
+            set_device_progress(progress_state, lock, display_name, 10, "설치 준비중")
             cmd = f'adb -s {device} install -r -d -g "{file_path}"'
+            set_device_progress(progress_state, lock, display_name, 55, "APK 설치중")
             result = subprocess.run(cmd, shell=True, capture_output=True, text=True, errors='replace')
-            status = "✅ 설치 성공" if "Success" in result.stdout else f"❌ 실패 ({result.stdout[-20:].strip()})"
+            output = extract_command_output(result)
+            elapsed = time.time() - start_time
+
+            if result.returncode == 0 and "Success" in (result.stdout or ""):
+                status = f"✅ 설치 성공 ({elapsed:.2f}s)"
+            else:
+                reason = summarize_failure_reason(output, result.returncode)
+                status = f"❌ 설치 실패 ({reason}, {elapsed:.2f}s)"
+
+            set_device_progress(progress_state, lock, display_name, 100, status)
         elif file_ext == '.obb':
+            set_device_progress(progress_state, lock, display_name, 15, "OBB 경로 준비중")
             target_dir = f"/sdcard/Android/obb/{target_name}"
-            subprocess.run(f"adb -s {device} shell mkdir -p {target_dir}", shell=True)
+            mkdir_result = subprocess.run(
+                f"adb -s {device} shell mkdir -p {target_dir}",
+                shell=True,
+                capture_output=True,
+                text=True,
+                errors='replace'
+            )
+            mkdir_output = extract_command_output(mkdir_result)
+            if mkdir_result.returncode != 0:
+                elapsed = time.time() - start_time
+                reason = summarize_failure_reason(mkdir_output, mkdir_result.returncode)
+                status = f"❌ 복사 실패 ({reason}, {elapsed:.2f}s)"
+                set_device_progress(progress_state, lock, display_name, 100, status)
+                return display_name, status, elapsed
+
             cmd = f'adb -s {device} push "{file_path}" "{target_dir}/"'
-            res = subprocess.run(cmd, shell=True, capture_output=True)
-            status = "✅ 복사 성공" if res.returncode == 0 else "❌ 복사 실패"
-    except: status = "❌ 오류"
+            set_device_progress(progress_state, lock, display_name, 60, "OBB 복사중")
+            res = subprocess.run(cmd, shell=True, capture_output=True, text=True, errors='replace')
+            output = extract_command_output(res)
+            elapsed = time.time() - start_time
+
+            if res.returncode == 0:
+                status = f"✅ 복사 성공 ({elapsed:.2f}s)"
+            else:
+                reason = summarize_failure_reason(output, res.returncode)
+                status = f"❌ 복사 실패 ({reason}, {elapsed:.2f}s)"
+
+            set_device_progress(progress_state, lock, display_name, 100, status)
+        else:
+            elapsed = time.time() - start_time
+            status = f"❌ 지원하지 않는 파일 형식 ({elapsed:.2f}s)"
+            set_device_progress(progress_state, lock, display_name, 100, status)
+    except Exception as e:
+        elapsed = time.time() - start_time
+        status = f"❌ 오류 ({str(e)[:60]}, {elapsed:.2f}s)"
+        set_device_progress(progress_state, lock, display_name, 100, status)
+
     return display_name, status, time.time() - start_time
+
+def run_selected_install(sel_file, ext):
+    if ext == '.bat':
+        subprocess.Popen(f'cmd /c "{sel_file}"', cwd=os.path.dirname(sel_file), shell=True)
+        print("✅ BAT 실행 완료")
+        return True
+
+    devs = get_connected_devices()
+    if not devs:
+        print("❌ 연결된 기기 없음")
+        return False
+
+    device_labels = {device: get_device_display_name(device) for device in devs}
+    print(f"\n▶ 실행 대상 기기 {len(devs)}대")
+    for label in device_labels.values():
+        print(f"   - {label}")
+
+    print(f"\n🚀 {len(devs)}대 병렬 작업 시작...")
+    device_order = [device_labels[d] for d in devs]
+    progress_state = {
+        display_name: {"percent": 0, "message": "대기중"}
+        for display_name in device_order
+    }
+    progress_lock = Lock()
+    rendered_lines = print_device_progress(progress_state, device_order, 0)
+    args = [
+        (sel_file, d, ext, basename(sel_file).replace('.obb',''), device_labels[d], progress_state, progress_lock)
+        for d in devs
+    ]
+
+    with ThreadPoolExecutor(max_workers=len(args) or 1) as executor:
+        futures = [executor.submit(process_device_task, arg) for arg in args]
+
+        while any(not future.done() for future in futures):
+            time.sleep(0.2)
+            rendered_lines = print_device_progress(progress_state, device_order, rendered_lines)
+
+        for future in futures:
+            future.result()
+        print_device_progress(progress_state, device_order, rendered_lines)
+
+    print()
+    return True
 
 # ==========================================
 # 🚀 3. 메인 인터페이스 (무한 루프 적용)
 # ==========================================
 def main():
-    base_path = load_or_request_config()
+    base_path, config_data = load_or_request_config()
+    top_5 = scan_target_files(base_path)
 
     while True: # 💡 무한 루프 시작
         os.system('cls' if os.name == 'nt' else 'clear') 
         print("="*42)
         print(" 🚀 KRAFTON QA 자동 설치기 v8.0 (연속 실행)")
         print("="*42)
-        
-        win_path = base_path
-        if os.name == 'nt' and not win_path.startswith("\\\\?\\"):
-            win_path = "\\\\?\\" + os.path.abspath(win_path)
+        print(f"현재 연결된 최상위 경로: {base_path}")
+        path_history = config_data.get("path_history", [])
+        if path_history:
+            print("최근 저장 경로(최대2건)")
+            for entry in path_history[:2]:
+                print(f"- {entry.get('path', base_path)}")
+        print()
 
-        # 파일 스캔
-        found_files = []
-        for root, dirs, files in os.walk(win_path):
-            for file in files:
-                ext = splitext(file)[1].lower()
-                if ext in TARGET_EXTENSIONS:
-                    full_path = join(root, file)
-                    try: found_files.append((full_path, getmtime(full_path)))
-                    except: continue
+        if not is_valid_base_path(base_path):
+            print("❌ 저장된 최상위 경로를 찾을 수 없습니다.")
+            base_path, config_data = load_or_request_config(force_change=True)
+            top_5 = scan_target_files(base_path)
+            continue
 
-        found_files.sort(key=lambda x: x[1], reverse=True)
-        top_5 = found_files[:5]
-        
-        print("[메뉴] (종료: q)")
-        print("0.  앱 수동 삭제 (패키지명)")
-        print("9.  외부 링크 설치 OR 로컬 경로 직접 입력")
+        print("[메뉴]")
+        print("0.  최상위 폴더 경로 변경")
         print("-" * 42)
+        print("최근 apk / obb / bat 파일 TOP 5")
+        print("-" * 42)
+        if not top_5:
+            print("표시할 apk / obb / bat 파일이 없습니다.")
         for i, (f_path, f_time) in enumerate(top_5):
             clean_p = f_path.replace("\\\\?\\", "").replace(base_path, "").lstrip("\\")
             t_str = time.strftime("%m-%d %H:%M", time.localtime(f_time))
             print(f"{i+1}. [{os.path.dirname(clean_p)}]\n   └ {os.path.basename(clean_p)} ({t_str})")
         print("-" * 42)
+        print("9.  외부 설치 경로 직접 입력")
+        print("esc. 화면 새로고침")
+        print("-" * 42)
 
-        u_in = input(f"▶ 번호 선택 (0, 9, 1~{len(top_5)}) [q:종료]: ").strip().lower()
+        u_in = prompt_menu_input(len(top_5))
         if u_in in ['q', 'exit', 'quit']: break
+        if u_in == 'esc':
+            top_5 = scan_target_files(base_path)
+            continue
         
         try:
             if not (u_in in ['0', '9'] or (u_in.isdigit() and 1 <= int(u_in) <= len(top_5))):
@@ -156,13 +471,12 @@ def main():
             choice = int(u_in)
         except: continue
 
-        devs = get_connected_devices()
-        if not devs: 
-            print("❌ 연결된 기기 없음"); input("\n엔터를 누르면 메뉴로 돌아갑니다."); continue
-        device_labels = {device: get_device_display_name(device) for device in devs}
-        print(f"\n▶ 실행 대상 기기 {len(devs)}대")
-        for label in device_labels.values():
-            print(f"   - {label}")
+        if choice == 0:
+            base_path, config_data = load_or_request_config(force_change=True)
+            top_5 = scan_target_files(base_path)
+            print("\n✅ 최상위 경로가 변경되었습니다.")
+            time.sleep(1)
+            continue
 
         sel_file = ""
         ext = ""
@@ -180,30 +494,16 @@ def main():
                     sel_file, ext = save_path, ".apk"
                 except Exception as e: print(f"❌ 실패: {e}"); time.sleep(2); continue
             else: print("❌ 경로 오류"); time.sleep(1); continue
-        
-        elif choice == 0:
-            pkg = input("\n▶ 삭제할 패키지명: ").strip()
-            if pkg:
-                with Pool() as p:
-                    res = p.map(process_uninstall_task, [(pkg, d, device_labels[d]) for d in devs])
-                for d, s, t in res: print(f"- [{d}] {s} ({t:.2f}s)")
-                input("\n작업 완료! 엔터를 누르면 메뉴로 돌아갑니다."); continue
         else:
             sel_file, _ = top_5[choice-1]
             ext = splitext(sel_file)[1].lower()
 
-        # 설치 실행
-        if ext == '.bat':
-            subprocess.Popen(f'cmd /c "{sel_file}"', cwd=os.path.dirname(sel_file), shell=True)
-            print("✅ BAT 실행 완료")
-        else:
-            print(f"\n🚀 {len(devs)}대 병렬 작업 시작...")
-            args = [(sel_file, d, ext, basename(sel_file).replace('.obb',''), device_labels[d]) for d in devs]
-            with Pool() as p:
-                res = p.map(process_device_task, args)
-            for d, s, t in res: print(f"- [{d}] {s} ({t:.2f}s)")
-
-        input("\n✅ 모든 작업 완료! 엔터를 누르면 메뉴로 돌아갑니다.")
+        while True:
+            run_selected_install(sel_file, ext)
+            retry_input = input("\n✅ 모든 작업 완료! 엔터: 메뉴로 돌아가기 / R: 동일 파일 재설치 > ").strip().lower()
+            if retry_input == 'r':
+                continue
+            break
 
     print("\n👋 프로그램을 종료합니다.")
 
