@@ -32,6 +32,7 @@ except ImportError:
     TkinterDnD = None
 
 from Auto_Install_CD import (
+    SUBPROCESS_NO_WINDOW,
     format_recent_file_entry,
     get_scan_parent_folders,
     get_selected_scan_folders,
@@ -1522,6 +1523,7 @@ class DesktopInstallerWidget:
                     encoding="utf-8",
                     errors="replace",
                     bufsize=1,
+                    creationflags=SUBPROCESS_NO_WINDOW,
                 )
                 self.device_tracker_process = process
                 self.event_queue.put(("device_tracker_changed", None))
